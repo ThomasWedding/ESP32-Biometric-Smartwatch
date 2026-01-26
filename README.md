@@ -12,14 +12,14 @@ Board: TBD (Feather for now)
 
 # External Libraries
 ## Testbench
-Adafruit GFX Library
-Adafruit MAX1704X
-Adafruit NeoPixel
-Adafruit ST7735 and ST7789 Library
-Adafruit TestBed
-Adafruit Unified Sensor
+Adafruit GFX Library, 
+Adafruit MAX1704X, 
+Adafruit NeoPixel, 
+Adafruit ST7735 and ST7789,  Library, 
+Adafruit TestBed, 
+Adafruit Unified Sensor, 
 ICM45605
 
 # Smartwatch
-ICM45605
+ICM45605, 
 TBD
