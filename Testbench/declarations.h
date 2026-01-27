@@ -10,6 +10,7 @@
 #include <Adafruit_NeoPixel.h>
 #include <Adafruit_TestBed.h>
 #include <Fonts/Org_01.h>
+#include <time.h>
 
 // Libraries that aren't needed for now
 //#include <Wire.h>                 // I2C Stuff

@@ -34,25 +34,18 @@ bool valid_spi_devices[2];
 int spi_device_count = 0;
 int IMUresult = 1;
 
-SPIClass *vAccel = new SPIClass();
-ICM456xx IMU( *vAccel, HSPI_SCLK );
+SPIClass *vAccel = new SPIClass(HSPI);
+ICM456xx IMU( *vAccel, HSPI_SS );
 inv_imu_sensor_data_t imu_data;
+
+// Used for debouncing
+int last_pressed = 0;
+const int debounce_ms = 250;
+volatile bool button_event = false;
 
 void IRAM_ATTR updateScreen()
 {
-  delayMicroseconds(50000);
-  if( currentPosition < 2 )
-    ++currentPosition;
-  else
-    currentPosition = 0;
-
-  for( int i = 0; i < sizeof(currentScreen); i++ )
-  {
-    if( i == currentPosition )
-      currentScreen[i] = true;
-    else
-      currentScreen[i] = false;
-  }
+  button_event = true;
 }
 
 void setup() {
@@ -67,7 +60,6 @@ void setup() {
 
   display.init(135, 240);           // Init ST7789 240x135
   display.setRotation(3);
-  canvas.setFont(&Org_01);
   canvas.setTextColor(ST77XX_WHITE);
 
   if (!lipo.begin()) {
@@ -86,12 +78,13 @@ void setup() {
   pinMode(0, INPUT_PULLUP);
   pinMode(1, INPUT_PULLDOWN);
   pinMode(2, INPUT_PULLDOWN);
-  attachInterrupt(0, updateScreen, FALLING);
-  attachInterrupt(1, updateScreen, RISING);
-  attachInterrupt(2, updateScreen, RISING);
+  attachInterrupt(digitalPinToInterrupt(0), updateScreen, FALLING);
+  attachInterrupt(digitalPinToInterrupt(1), updateScreen, RISING);
+  attachInterrupt(digitalPinToInterrupt(2), updateScreen, RISING);
 
   //IMU.startAccel(100, 16);
   //IMU.startGyro(100, 2000);
+  Serial.println("SETUP DONE");
 }
 
 // Function to scan SPI devices
@@ -145,20 +138,26 @@ void loop() {
   if (j % 2 == 0)
   {
     canvas.fillScreen(ST77XX_BLACK);
-    canvas.setCursor(0, 17);
+
     if(currentScreen[0] == true)
     {
-      canvas.setTextColor(ST77XX_RED);
-      canvas.println("Adafruit Feather");
-      canvas.setTextColor(ST77XX_YELLOW);
-      canvas.println("ESP32-S3 TFT Demo");
+      canvas.setTextColor(ST77XX_BLUE);
+      canvas.setCursor(0, 0);
+      canvas.print("Battery");
+      canvas.setTextColor(ST77XX_WHITE);
+      canvas.setCursor(0, 67);
+      canvas.print("I2C Data");
+      canvas.setCursor(0, 125);
+      canvas.print("SPI Data");
+      canvas.setCursor(120, 0);
       canvas.setTextColor(ST77XX_GREEN); 
       canvas.print("Battery: ");
       canvas.setTextColor(ST77XX_WHITE);
       canvas.print(lipo.cellVoltage(), 1);
-      canvas.print(" V  /  ");
+      canvas.print("V / ");
       canvas.print(lipo.cellPercent(), 0);
       canvas.println("%");
+      canvas.setCursor(120, 8);
       canvas.setTextColor(ST77XX_CYAN);
       canvas.print("Buttons: ");
       if (!digitalRead(0)) 
@@ -176,14 +175,19 @@ void loop() {
         canvas.setTextColor(ST77XX_BLUE);
         canvas.print("D2");
       }
-      Serial.println("Screen #1!");
+      // Serial.println("Screen #1!");
     }
     else if(currentScreen[1] == true)
     {
-      canvas.setTextColor(ST77XX_GREEN);
-      canvas.println("Adafruit Feather");
-      canvas.setTextColor(ST77XX_YELLOW);
-      canvas.println("ESP32-S3 TFT Demo");
+      canvas.setTextColor(ST77XX_BLUE);
+      canvas.setCursor(0, 67);
+      canvas.print("I2C Data");
+      canvas.setTextColor(ST77XX_WHITE);
+      canvas.setCursor(0, 0);
+      canvas.print("Battery");
+      canvas.setCursor(0, 125);
+      canvas.print("SPI Data");
+      canvas.setCursor(120, 0);
       canvas.setTextColor(ST77XX_ORANGE);
       canvas.print("I2C: ");
       canvas.setTextColor(ST77XX_WHITE);
@@ -197,6 +201,7 @@ void loop() {
         }
       }
       canvas.println("");
+      canvas.setCursor(120, 8);
       canvas.print("SPI Test: ");
       canvas.setTextColor(ST77XX_WHITE);
       vAccel->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
@@ -209,40 +214,53 @@ void loop() {
     else if(currentScreen[2] == true)
     {
       canvas.setTextColor(ST77XX_BLUE);
-      canvas.println("Adafruit Feather");
-      canvas.setTextColor(ST77XX_YELLOW);
-      canvas.println("ESP32-S3 TFT Demo");
+      canvas.setCursor(0, 125);
+      canvas.print("SPI Data");
+      canvas.setTextColor(ST77XX_WHITE);
+      canvas.setCursor(0, 0);
+      canvas.print("Battery");
+      canvas.setCursor(0, 65);
+      canvas.print("I2C Data");
+      canvas.setCursor(120, 0);
       canvas.setTextColor(ST77XX_MAGENTA);
       canvas.print("SPI: ");
       canvas.setTextColor(ST77XX_WHITE);
       if( valid_spi_devices[0] )
         canvas.println("ST7789 TFT");
+      canvas.setCursor(120, 8);
       if( valid_spi_devices[1] )
         canvas.println(", ICM45605");
+      canvas.setCursor(120, 8*2);
       canvas.setTextColor(ST77XX_RED);
       canvas.print("AccelX: ");
       canvas.setTextColor(ST77XX_WHITE);
       canvas.println(imu_data.accel_data[0]);
+      canvas.setCursor(120, 8*3);
       canvas.setTextColor(ST77XX_RED);
       canvas.print("AccelY: ");
       canvas.setTextColor(ST77XX_WHITE);
       canvas.println(imu_data.accel_data[1]);
+      canvas.setCursor(120, 8*4);
       canvas.setTextColor(ST77XX_RED);
       canvas.print("AccelZ: ");
       canvas.setTextColor(ST77XX_WHITE);
       canvas.println(imu_data.accel_data[2]);
+      canvas.setCursor(120, 8*5);
       canvas.setTextColor(ST77XX_RED);
       canvas.print("GyroX: ");
       canvas.setTextColor(ST77XX_WHITE);
       canvas.println(imu_data.gyro_data[0]);
+      canvas.setCursor(120, 8*6);
       canvas.setTextColor(ST77XX_RED);
       canvas.print("GyroY: ");
       canvas.setTextColor(ST77XX_WHITE);
       canvas.println(imu_data.gyro_data[1]);
+      canvas.setCursor(120, 8*7);
       canvas.setTextColor(ST77XX_RED);
       canvas.print("GyroZ: ");
       canvas.setTextColor(ST77XX_WHITE);
       canvas.println(imu_data.gyro_data[2]);
+      canvas.setCursor(120, 8*8);
       canvas.setTextColor(ST77XX_RED);
       canvas.print("Temperature: ");
       canvas.setTextColor(ST77XX_WHITE);
@@ -255,18 +273,40 @@ void loop() {
       //Serial.println(currentPosition);
     }
       
-    /*if( !digitalRead(0) )
-      Serial.println("D0 Pressed!");
-    if( digitalRead(1) )
-      Serial.println("D1 Pressed!");
-    if( digitalRead(2) )
-      Serial.println("D2 Pressed!");*/
-
     display.drawRGBBitmap(0, 0, canvas.getBuffer(), 240, 135);
     pinMode(TFT_BACKLITE, OUTPUT);
     digitalWrite(TFT_BACKLITE, HIGH);
   }
   
+  // Software debouncer, for when switching screens
+  if (button_event)
+  {
+    button_event = false;
+
+    int now = millis();
+    if (now - last_pressed > debounce_ms)
+    {
+      last_pressed = now;
+      
+      if (!digitalRead(0)) 
+      {
+        currentPosition = 0;
+      }
+      else if (digitalRead(1)) 
+      {
+        currentPosition = 1;
+      }
+      else 
+      {
+        currentPosition = 2;
+      }
+      for (int index = 0; index < 3; ++index)
+      {
+        currentScreen[index] = (index == currentPosition);
+      }
+    }
+  }
+
   TB.setColor(TB.Wheel(j++));
   delay(10);
   return;
