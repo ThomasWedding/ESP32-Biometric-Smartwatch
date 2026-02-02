@@ -14,5 +14,5 @@ Board: TBD (Feather for now)
 ## Testbench branch
 See the platformio.ini file
 
-# Smartwatch branch
+## Smartwatch branch
 See the platformio.ini file
