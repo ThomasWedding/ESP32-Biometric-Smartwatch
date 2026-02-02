@@ -1,11 +1,14 @@
-// Modified version of demo program found here:
-// https://github.com/adafruit/Adafruit_Learning_System_Guides/blob/main/Factory_Tests/Feather_ESP32S3_ReverseTFT_FactoryTest/Feather_ESP32S3_ReverseTFT_FactoryTest.ino
-#include "declarations.h"
-
-//#define SPI_MOSI 23
-//#define SPI_MISO 19
-//#define SPI_SCK 18
-//#define SPI_CS 5
+#include <Arduino.h>
+#include <SPI.h>
+#include <ICM45605.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#include <Adafruit_MAX1704X.h>
+#include <Adafruit_NeoPixel.h>
+#include <Adafruit_TestBed.h>
+#include <Fonts/Org_01.h>
+#include <lvgl.h>
+#include <time.h>
 
 // ESP32-S3 SPI Pins
 // SPI2
