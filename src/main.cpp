@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include <SPI.h>
+#include <Wire.h>
 #include <ICM45605.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
@@ -12,19 +12,24 @@
 
 // ESP32-S3 SPI Pins
 // SPI2
-#define HSPI_SS 10
-#define HSPI_MOSI 11
-#define HSPI_SCLK 12
-#define HSPI_MISO 13
+//#define HSPI_SS 10
+//#define HSPI_MOSI 11
+//#define HSPI_SCLK 12
+//#define HSPI_MISO 13
 
-// SPI3 (Used by display)
-#define VSPI_SS 39
-#define VSPI_MOSI 35
-#define VSPI_SCLK 36
-#define VSPI_MISO 37
+// SPI3
+//#define VSPI_SS 42
+//#define VSPI_MOSI 35
+//#define VSPI_SCLK 36
+//#define VSPI_MISO 37
+//#define I2Caddress 1101000
+
+// ICM456xx IMU — I2C settings (tune here)
+#define IMU_I2C_ADDR_LSB true    // false → 0x68, true → 0x69
+#define IMU_I2C_FREQ     100000  // Bus clock in Hz (100000–1000000)
 
 extern Adafruit_TestBed TB;
-Adafruit_MAX17048 lipo;
+//Adafruit_MAX17048 lipo;
 Adafruit_ST7789 display = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 GFXcanvas16 canvas(240, 135);
 
@@ -35,10 +40,9 @@ int currentPosition = 0;                      // Determines current screen being
 int j = 0;
 bool valid_spi_devices[2];
 int spi_device_count = 0;
-int IMUresult = 1;
 
-SPIClass *vAccel = new SPIClass(HSPI);
-ICM456xx IMU( *vAccel, HSPI_SS );
+int IMUresult = 1;
+ICM456xx IMU(Wire, IMU_I2C_ADDR_LSB);
 inv_imu_sensor_data_t imu_data;
 
 // Used for debouncing
@@ -65,18 +69,21 @@ void setup() {
   display.setRotation(3);
   canvas.setTextColor(ST77XX_WHITE);
 
-  if (!lipo.begin()) {
-    Serial.println(F("Couldnt find Adafruit MAX17048?\nMake sure a battery is plugged in!"));
-    while (1) delay(10);
-  }
+  //if (!lipo.begin()) {
+  //  Serial.println(F("Couldnt find Adafruit MAX17048?\nMake sure a battery is plugged in!"));
+  //  while (1) delay(10);
+  //}
     
-  Serial.print(F("Found MAX17048"));
-  Serial.print(F(" with Chip ID: 0x"));
-  Serial.println(lipo.getChipID(), HEX);
+  //Serial.print(F("Found MAX17048"));
+  //Serial.print(F(" with Chip ID: 0x"));
+  //Serial.println(lipo.getChipID(), HEX);
 
-  vAccel->begin(HSPI_SCLK, HSPI_MISO, HSPI_MOSI, HSPI_SS);
-  pinMode(vAccel->pinSS(), OUTPUT);
+  //pinMode(3, OUTPUT_OPEN_DRAIN);
+  //pinMode(4, OUTPUT_OPEN_DRAIN);
+  Serial.println(F("IMU Is Being Started!"));
   IMUresult = IMU.begin();
+  Serial.println( IMUresult );
+  Serial.println(F("IMU Started Successfully!"));
 
   pinMode(0, INPUT_PULLUP);
   pinMode(1, INPUT_PULLDOWN);
@@ -85,13 +92,18 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(1), updateScreen, RISING);
   attachInterrupt(digitalPinToInterrupt(2), updateScreen, RISING);
 
-  //IMU.startAccel(100, 16);
-  //IMU.startGyro(100, 2000);
+  Serial.println("Starting Accel");
+  IMU.startAccel(100, 16);
+  Serial.println("Accel Complete!");
+  Serial.println("Starting Gyro");
+  IMU.startGyro(100, 2000);
+  Serial.println("Gyro Complete!");
+  delay(100);
   Serial.println("SETUP DONE");
 }
 
 // Function to scan SPI devices
-void scanSPIDevices() 
+void scanSPIDevices()
 {
   Serial.print("SPI scan: ");
   spi_device_count = 0;
@@ -103,12 +115,6 @@ void scanSPIDevices()
   valid_spi_devices[0] = true;
   spi_device_count++;
 
-  if( !IMUresult )
-  {
-    Serial.print( ", ICM45605" );
-    valid_spi_devices[1] = true;
-    spi_device_count++;
-  }
   Serial.println();
 }
 
@@ -131,11 +137,13 @@ void scanI2CDevices( bool (&valid_i2c)[128] )
 }
 
 void loop() {
+  //inv_imu_sensor_data_t imu_data;
   if (j == 0)
   {
     scanI2CDevices(valid_i2c);
     scanSPIDevices();
-    //IMU.getDataFromRegisters(imu_data);
+    IMU.getDataFromRegisters(imu_data);
+    Serial.println("HAHA");
   }
 
   if (j % 2 == 0)
@@ -153,25 +161,25 @@ void loop() {
       canvas.setCursor(0, 125);
       canvas.print("SPI Data");
       canvas.setCursor(120, 0);
-      canvas.setTextColor(ST77XX_GREEN); 
+      canvas.setTextColor(ST77XX_GREEN);
       canvas.print("Battery: ");
       canvas.setTextColor(ST77XX_WHITE);
-      canvas.print(lipo.cellVoltage(), 1);
-      canvas.print("V / ");
-      canvas.print(lipo.cellPercent(), 0);
-      canvas.println("%");
+      //canvas.print(lipo.cellVoltage(), 1);
+      //canvas.print("V / ");
+      //canvas.print(lipo.cellPercent(), 0);
+      //canvas.println("%");
       canvas.setCursor(120, 8);
       canvas.setTextColor(ST77XX_CYAN);
       canvas.print("Buttons: ");
       if (!digitalRead(0)) 
       {
         canvas.setTextColor(ST77XX_RED);
-        canvas.print("D0, ");
+        canvas.print("D0 ");
       }
       if (digitalRead(1)) 
       {
         canvas.setTextColor(ST77XX_GREEN);
-        canvas.print("D1, ");
+        canvas.print("D1 ");
       }
       if (digitalRead(2)) 
       {
@@ -194,7 +202,7 @@ void loop() {
       canvas.setTextColor(ST77XX_ORANGE);
       canvas.print("I2C: ");
       canvas.setTextColor(ST77XX_WHITE);
-      for (uint8_t a=0x01; a<=0x7F; a++) 
+      for (uint8_t a=0x01; a<=0x7F; a++)
       {
         if (valid_i2c[a])  
         {
@@ -204,15 +212,7 @@ void loop() {
         }
       }
       canvas.println("");
-      canvas.setCursor(120, 8);
-      canvas.print("SPI Test: ");
-      canvas.setTextColor(ST77XX_WHITE);
-      vAccel->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-      digitalWrite(vAccel->pinSS(), LOW);
-      canvas.println(vAccel->transfer(0b11110000));
-      digitalWrite(vAccel->pinSS(), HIGH);
-      vAccel->endTransaction();
-      //Serial.println("Screen #2!");
+      //Serial.println("Screen #2!"); 
     }
     else if(currentScreen[2] == true)
     {
@@ -230,9 +230,6 @@ void loop() {
       canvas.setTextColor(ST77XX_WHITE);
       if( valid_spi_devices[0] )
         canvas.println("ST7789 TFT");
-      canvas.setCursor(120, 8);
-      if( valid_spi_devices[1] )
-        canvas.println(", ICM45605");
       canvas.setCursor(120, 8*2);
       canvas.setTextColor(ST77XX_RED);
       canvas.print("AccelX: ");
@@ -292,21 +289,14 @@ void loop() {
       last_pressed = now;
       
       if (!digitalRead(0)) 
-      {
         currentPosition = 0;
-      }
       else if (digitalRead(1)) 
-      {
         currentPosition = 1;
-      }
       else 
-      {
         currentPosition = 2;
-      }
+
       for (int index = 0; index < 3; ++index)
-      {
         currentScreen[index] = (index == currentPosition);
-      }
     }
   }
 
