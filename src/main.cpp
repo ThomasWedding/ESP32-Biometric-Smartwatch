@@ -405,7 +405,6 @@ void scanI2CDevices( bool (&valid_i2c)[128] )
 
 
 void loop() {
-  //inv_imu_sensor_data_t imu_data;
   if (j == 0)
   {
     scanI2CDevices(valid_i2c);
