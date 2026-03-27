@@ -1,6 +1,5 @@
 #include <Arduino.h>
-#include <SPI.h>
-#include <ICM45605.h>
+#include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <Adafruit_MAX1704X.h>
@@ -10,18 +9,29 @@
 #include <lvgl.h>
 #include <time.h>
 
+// Old IMU
+// #include <ICM45605.h>
+// New IMU
+#include <Adafruit_LSM6DSOX.h>
+#include <Adafruit_Sensor.h>
+
 // ESP32-S3 SPI Pins
 // SPI2
-#define HSPI_SS 10
-#define HSPI_MOSI 11
-#define HSPI_SCLK 12
-#define HSPI_MISO 13
+//#define HSPI_SS 10
+//#define HSPI_MOSI 11
+//#define HSPI_SCLK 12
+//#define HSPI_MISO 13
 
-// SPI3 (Used by display)
-#define VSPI_SS 39
-#define VSPI_MOSI 35
-#define VSPI_SCLK 36
-#define VSPI_MISO 37
+// SPI3
+//#define VSPI_SS 42
+//#define VSPI_MOSI 35
+//#define VSPI_SCLK 36
+//#define VSPI_MISO 37
+//#define I2Caddress 1101000
+
+// ICM456xx IMU — I2C settings (tune here)
+#define IMU_I2C_ADDR_LSB true    // false → 0x68, true → 0x69
+#define IMU_I2C_FREQ     100000  // Bus clock in Hz (100000–1000000)
 
 extern Adafruit_TestBed TB;
 Adafruit_MAX17048 lipo;
@@ -59,7 +69,6 @@ static lv_obj_t *battery_label;
 static lv_obj_t *i2c_nav_label;
 static lv_obj_t *spi_nav_label;
 
-
 bool valid_i2c[128];                          // Array for I2C Scan
 bool currentScreen[] = {true, false, false};  // Array for determining currently shown screen
 int currentPosition = 0;                      // Determines current screen being shown
@@ -67,11 +76,18 @@ int currentPosition = 0;                      // Determines current screen being
 int j = 0;
 bool valid_spi_devices[2];
 int spi_device_count = 0;
-int IMUresult = 1;
 
-SPIClass *vAccel = new SPIClass(HSPI);
-ICM456xx IMU( *vAccel, HSPI_SS );
-inv_imu_sensor_data_t imu_data;
+// OLD IMU
+// int IMUresult = 1;
+// ICM456xx IMU(Wire, IMU_I2C_ADDR_LSB);
+// inv_imu_sensor_data_t imu_data;
+// New IMU
+Adafruit_LSM6DS lsm6dso;
+bool imu_ok = false;
+
+sensors_event_t accel;
+sensors_event_t gyro;
+sensors_event_t temp;
 
 // Used for debouncing
 int last_pressed = 0;
@@ -191,15 +207,7 @@ void update_i2c_screen()
     }
   }
   lv_label_set_text(i2c_data_label, i2c_buf);
-
-  vAccel->beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-  digitalWrite(vAccel->pinSS(), LOW);
-  uint8_t spi_test = vAccel->transfer(0b11110000);
-  digitalWrite(vAccel->pinSS(), HIGH);
-  vAccel->endTransaction();
-
-  snprintf(spi_buf, sizeof(spi_buf), "SPI Test: %u", spi_test);
-  lv_label_set_text(spi_test_label, spi_buf);
+  lv_label_set_text(spi_test_label, "LSM6DSO uses I2C");
 }
 
 void create_spi_screen()
@@ -243,12 +251,12 @@ void update_spi_screen()
 
   strcpy(spi_buf, "SPI: ");
   if (valid_spi_devices[0]) strncat(spi_buf, "ST7789 TFT ", sizeof(spi_buf) - strlen(spi_buf) - 1);
-  if (valid_spi_devices[1]) strncat(spi_buf, "ICM45605", sizeof(spi_buf) - strlen(spi_buf) - 1);
+  if (valid_spi_devices[1]) strncat(spi_buf, "LSM6DSO", sizeof(spi_buf) - strlen(spi_buf) - 1);
   lv_label_set_text(spi_devices_label, spi_buf);
 
-  if (!IMUresult)
+  if (imu_ok)
   {
-    IMU.getDataFromRegisters(imu_data);
+    lsm6dso.getEvent(&accel, &gyro, &temp);
 
     snprintf(
       imu_buf, sizeof(imu_buf),
@@ -259,18 +267,18 @@ void update_spi_screen()
       "GyroY:  %.2f\n"
       "GyroZ:  %.2f\n"
       "Temp:   %.2f",
-      imu_data.accel_data[0],
-      imu_data.accel_data[1],
-      imu_data.accel_data[2],
-      imu_data.gyro_data[0],
-      imu_data.gyro_data[1],
-      imu_data.gyro_data[2],
-      imu_data.temp_data
+      accel.acceleration.x,
+      accel.acceleration.y,
+      accel.acceleration.z,
+      gyro.gyro.x,
+      gyro.gyro.y,
+      gyro.gyro.z,
+      temp.temperature
     );
   }
   else
   {
-    snprintf(imu_buf, sizeof(imu_buf), "IMU not detected");
+    snprintf(imu_buf, sizeof(imu_buf), "LSM6DSO not detected");
   }
 
   lv_label_set_text(imu_label, imu_buf);
@@ -317,18 +325,16 @@ void setup() {
   lv_scr_load(battery_screen);
 
   if (!lipo.begin()) {
-    Serial.println(F("Couldnt find Adafruit MAX17048?\nMake sure a battery is plugged in!"));
-    while (1) delay(10);
+   Serial.println(F("Couldnt find Adafruit MAX17048?\nMake sure a battery is plugged in!"));
+   while (1) delay(10);
   }
     
   Serial.print(F("Found MAX17048"));
   Serial.print(F(" with Chip ID: 0x"));
   Serial.println(lipo.getChipID(), HEX);
 
-  vAccel->begin(HSPI_SCLK, HSPI_MISO, HSPI_MOSI, HSPI_SS);
-  pinMode(vAccel->pinSS(), OUTPUT);
-  IMUresult = IMU.begin();
-
+  //pinMode(3, OUTPUT_OPEN_DRAIN);
+  //pinMode(4, OUTPUT_OPEN_DRAIN);
   pinMode(0, INPUT_PULLUP);
   pinMode(1, INPUT_PULLDOWN);
   pinMode(2, INPUT_PULLDOWN);
@@ -336,30 +342,46 @@ void setup() {
   attachInterrupt(digitalPinToInterrupt(1), updateScreen, RISING);
   attachInterrupt(digitalPinToInterrupt(2), updateScreen, RISING);
 
-  //IMU.startAccel(100, 16);
-  //IMU.startGyro(100, 2000);
+  // New IMU set up, used to start up
+  Wire.begin();
+  Wire.setClock(IMU_I2C_FREQ);
+
+  Serial.println("Starting LSM6DSO...");
+
+  imu_ok = lsm6dso.begin_I2C();   // default I2C address chosen by board wiring / SA0
+
+  if (!imu_ok) {
+    Serial.println("LSM6DSO not found");
+  } else {
+    Serial.println("LSM6DSO found");
+
+    lsm6dso.setAccelRange(LSM6DS_ACCEL_RANGE_16_G);
+    lsm6dso.setGyroRange(LSM6DS_GYRO_RANGE_2000_DPS);
+
+    lsm6dso.setAccelDataRate(LSM6DS_RATE_104_HZ);
+    lsm6dso.setGyroDataRate(LSM6DS_RATE_104_HZ);
+  }
   Serial.println("SETUP DONE");
 }
 
 // Function to scan SPI devices
-void scanSPIDevices() 
+void scanSPIDevices()
 {
-  Serial.print("SPI scan: ");
+  Serial.print("Devices: ");
   spi_device_count = 0;
 
-  // Report known SPI devices on this board
-  Serial.print("ST7789 TFT (CS:");
-  Serial.print(TFT_CS);
-  Serial.print(")");
+  Serial.print("ST7789 TFT");
   valid_spi_devices[0] = true;
   spi_device_count++;
 
-  if( !IMUresult )
-  {
-    Serial.print( ", ICM45605" );
+  if (imu_ok) {
+    Serial.print(", LSM6DSO");
     valid_spi_devices[1] = true;
     spi_device_count++;
+  } else {
+    valid_spi_devices[1] = false;
   }
+
   Serial.println();
 }
 
@@ -383,11 +405,12 @@ void scanI2CDevices( bool (&valid_i2c)[128] )
 
 
 void loop() {
+  //inv_imu_sensor_data_t imu_data;
   if (j == 0)
   {
     scanI2CDevices(valid_i2c);
     scanSPIDevices();
-    //IMU.getDataFromRegisters(imu_data);
+    Serial.println("HAHA");
   }
 
   if (currentPosition == 0)
@@ -417,11 +440,13 @@ void loop() {
         currentPosition = 0;
         lv_scr_load(battery_screen);
       }
-      else if (digitalRead(1)) {
+      else if (digitalRead(1)) 
+      {
         currentPosition = 1;
         lv_scr_load(i2c_screen);
       }
-      else {
+      else 
+      {
         currentPosition = 2;
         lv_scr_load(spi_screen);
       }
