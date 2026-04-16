@@ -1,14 +1,30 @@
 #include "powerManager.h"
+#include "as7038rb.h"
+#include "lsm6dso.h"
 #include "debug.h"
 #include "esp_sleep.h"
 #include <Arduino.h>
+#include <WiFi.h>
 
 static const uint64_t PWR_MS_TO_US = 1000ULL;
 
-// Performs any one-time power manager setup. Currently a no-op placeholder.
+// GPIO pins that are unused by any subsystem; pulled down to prevent floating-pin leakage.
+static const int PWR_UNUSED_PINS[]    = { 1, 2, 5 };
+static const int PWR_UNUSED_PIN_COUNT = 3;
+
+// Disables WiFi, reduces CPU to 80 MHz, and pulls unused GPIO pins down to
+// prevent leakage current. Must be called once at startup before sensor init.
 void pmInit()
 {
-    DBG( "PWR", "Power manager initialised" );
+    WiFi.mode( WIFI_OFF );
+    setCpuFrequencyMhz( 80 );
+
+    for( int i = 0; i < PWR_UNUSED_PIN_COUNT; i++ )
+    {
+        pinMode( PWR_UNUSED_PINS[ i ], INPUT_PULLDOWN );
+    }
+
+    DBG( "PWR", "Power manager initialised (CPU=80MHz, WiFi=OFF, unused pins pulled down)" );
 }
 
 // Puts the MCU into light sleep for durationMs milliseconds, then returns.
@@ -29,18 +45,20 @@ void pmDeepSleep( uint32_t durationMs )
     // Execution does not continue here after deep sleep
 }
 
-// Drives the sensor power-rail enable pin HIGH to power sensors.
+// Re-enables the PPG sensor (LDO+OSC on, registers reloaded) and the IMU gyroscope.
+// Must be called before ppgStartSampling() at the start of each sampling window.
 void pmEnableSensors()
 {
-    DBG( "PWR", "Enabling sensor power rail" );
-    // TODO: drive a GPIO power-rail enable pin HIGH to power sensors,
-    //       then re-initialise I2C peripherals after rail stabilises
+    DBG( "PWR", "Enabling sensors" );
+    imuEnableGyro();
+    ppgPowerUp();
 }
 
-// Drives the sensor power-rail enable pin LOW to cut sensor power.
+// Powers down the PPG sensor (LDO+OSC off, ~0.5 µA) and disables the IMU gyroscope.
+// The IMU accelerometer stays on to keep the pedometer and tilt detection running.
 void pmDisableSensors()
 {
-    DBG( "PWR", "Disabling sensor power rail" );
-    // TODO: drive a GPIO power-rail enable pin LOW to cut sensor power
-    //       when not sampling, saving ~1–2 mA quiescent current
+    DBG( "PWR", "Disabling sensors" );
+    ppgPowerDown();
+    imuDisableGyro();
 }

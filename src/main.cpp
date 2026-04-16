@@ -1,6 +1,5 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <WiFi.h>
 #include "dataBuffer.h"
 #include "as7038rb.h"
 #include "lsm6dso.h"
@@ -20,10 +19,10 @@ bool debugSerialEnabled = true;
 //   3 - IMU sensor test: only LSM6DSO is initialized
 //   4 - real PPG + dummy IMU
 //   5 - real IMU + dummy PPG
-#define TESTING_MODE 5
+#define TESTING_MODE 2
 
-static const uint32_t SAMPLE_WINDOW_MS   = 5000; // duration of each PPG acquisition
-static const uint32_t SAMPLE_INTERVAL_MS = 5000; // idle period between acquisitions
+static const uint32_t SAMPLE_WINDOW_MS   = 15000; // duration of each PPG acquisition
+static const uint32_t SAMPLE_INTERVAL_MS = 45000; // idle period between acquisitions
 
 // Fallback date and time displayed if the watch has never received a BLE time sync.
 // Once Android sends a timestamp, bleGetCurrentTime() is used instead and these values
@@ -47,12 +46,15 @@ static const bool     AUTO_SCREEN_OFF_ENABLED = true;  // set false to keep scre
 // Lift-to-wake acceleration thresholds (g).
 // After a tilt interrupt, all axis conditions must be met to wake the screen.
 // Should be tuned based on the physical orientation of the IMU on the wrist.
-static const float WAKE_ACCEL_X_MIN = -1.0f;
-static const float WAKE_ACCEL_X_MAX =  1.0f;
-static const float WAKE_ACCEL_Y_MIN = -1.0f;
-static const float WAKE_ACCEL_Y_MAX =  1.0f;
+static const float WAKE_ACCEL_X_MIN = -0.7f;
+static const float WAKE_ACCEL_X_MAX =  0.7f;
+static const float WAKE_ACCEL_Y_MIN = -0.4f;
+static const float WAKE_ACCEL_Y_MAX =  0.3f;
 static const float WAKE_ACCEL_Z_MIN = -1.0f;
-static const float WAKE_ACCEL_Z_MAX =  1.0f;
+static const float WAKE_ACCEL_Z_MAX = -0.3f;
+
+// Number of consecutive steps required before the pedometer starts counting.
+static const uint8_t IMU_PEDO_DEBOUNCE_STEPS = 10;
 
 // Hardware pins
 static const int BUTTON_D0_PIN = 0;  // GPIO0 - boot button, active LOW
@@ -167,14 +169,15 @@ static void sensorTask( void* pvParameters )
             bpm, spo2, hrv, ( unsigned long )steps );
 #endif
 
-        // Build reading struct
+        // Build reading struct. Use Unix ms if time is synced, otherwise millis().
         BiometricReading reading;
-        reading.timestamp = millis();
-        reading.heartRate = bpm;
-        reading.spo2      = spo2;
-        reading.hrv       = hrv;
-        reading.stepCount = steps;
-        reading.valid     = ( bpm > 0 );
+        reading.timestampIsUnix = bleIsTimeSynced();
+        reading.timestamp       = reading.timestampIsUnix ? bleGetUnixMs() : ( uint64_t )millis();
+        reading.heartRate       = bpm;
+        reading.spo2            = spo2;
+        reading.hrv             = hrv;
+        reading.stepCount       = steps;
+        reading.valid           = ( bpm > 0 );
 
         // Resolve display time: use RTC if synced via BLE, otherwise use fallback constants.
         uint8_t  clkMonth  = CLOCK_MONTH,  clkDay    = CLOCK_DAY;
@@ -191,18 +194,17 @@ static void sensorTask( void* pvParameters )
                            clkMonth, clkDay, clkYear,
                            clkHour, clkMinute, clkSecond, clkIsPm );
 
-        // Only transmit or buffer valid readings
+        // Always buffer valid readings. bleTask flushes the buffer every 100 ms;
+        // bleFlushBuffer() back-converts any pre-sync millis timestamps to Unix ms
+        // before sending, so Android always receives a Unix epoch ms timestamp once
+        // time has been synced.
         if( reading.valid )
         {
-            if( bleIsConnected() )
-            {
-                DBG( "MAIN", "Sending reading via BLE (t=%lu)", ( unsigned long )reading.timestamp );
-                bleSendReading( reading );
-            } else 
-            {
-                DBG( "MAIN", "BLE disconnected, buffering reading (buf=%u/%u)", bufGetCount(), DATA_BUFFER_CAPACITY );
-                bufPush( reading );
-            }
+            DBG( "MAIN", "Buffering reading (t=%llu unix=%d, buf=%u/%u)",
+                ( unsigned long long )reading.timestamp,
+                reading.timestampIsUnix ? 1 : 0,
+                bufGetCount(), DATA_BUFFER_CAPACITY );
+            bufPush( reading );
         } else {
             DBG( "MAIN", "Invalid reading (BPM=0), dropping" );
         }
@@ -404,10 +406,11 @@ void setup()
         while( !Serial && millis() < deadline );
     }
 
+    pmInit();
+
     DBG( "BOOT", "I2C bus init" );
     Wire.begin();
 
-    WiFi.mode( WIFI_OFF );
     bufInit();
     dispInit();
     dispShowSplash();
@@ -421,12 +424,11 @@ void setup()
     // Normal operation. Initialize all sensors, BLE, and power management
     DBG( "BOOT", "Mode 0: normal operation" );
     batInit();
-    imuInit();
+    imuInit( IMU_PEDO_DEBOUNCE_STEPS );
     imuEnableTiltDetection();
     imuAvailable = true;
     ppgInit();
     bleInit();
-    pmInit();
 
     // IMU INT1 interrupt for lift-to-wake
     pinMode( IMU_INT1_PIN, INPUT );
@@ -443,7 +445,6 @@ void setup()
     batInit();
     randomSeed( esp_random() );
     bleInit();
-    pmInit();
 
     DBG( "BOOT", "Creating sensorTask (core 0) and bleTask (core 1)" );
     xTaskCreatePinnedToCore( sensorTask, "sensorTask", 8192, nullptr, 1, nullptr, 0 );
@@ -459,7 +460,7 @@ void setup()
 #elif TESTING_MODE == 3
     // Only LSM6DSO initialized; raw accel/gyro/steps shown on display + serial
     DBG( "BOOT", "Mode 3: IMU raw test (LSM6DSO only)" );
-    imuInit();
+    imuInit( IMU_PEDO_DEBOUNCE_STEPS );
     imuEnableTiltDetection();
     imuAvailable = true;
 
@@ -487,7 +488,7 @@ void setup()
     DBG( "BOOT", "Mode 5: real IMU + dummy PPG" );
     batInit();
     randomSeed( esp_random() );
-    imuInit();
+    imuInit( IMU_PEDO_DEBOUNCE_STEPS );
     imuEnableTiltDetection();
     imuAvailable = true;
     bleInit();

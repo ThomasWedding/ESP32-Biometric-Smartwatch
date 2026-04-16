@@ -35,8 +35,8 @@ bool bufPush( const BiometricReading& reading )
     bufItems++;
     uint16_t cnt = bufItems;  // snapshot inside critical section
     portEXIT_CRITICAL( &bufMux );
-    DBG( "BUF", "Pushed reading (t=%lu), count=%u/%u",
-        ( unsigned long )reading.timestamp, cnt, DATA_BUFFER_CAPACITY );
+    DBG( "BUF", "Pushed reading (t=%llu unix=%d), count=%u/%u",
+        ( unsigned long long )reading.timestamp, reading.timestampIsUnix ? 1 : 0, cnt, DATA_BUFFER_CAPACITY );
     return true;
 }
 

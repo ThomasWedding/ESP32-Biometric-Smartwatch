@@ -20,9 +20,6 @@ static const uint8_t REG_PAGE_RW         = 0x17;
 // Embedded function register address for pedometer debounce
 static const uint16_t REG_PEDO_DEB_STEPS_CONF = 0x184;
 
-// Number of consecutive steps required before the pedometer starts counting.
-static const uint8_t IMU_PEDO_DEBOUNCE_STEPS = 6;
-
 // I2C helpers for embedded function page registers.
 // The LSM6DSO's pedometer debounce register is in an embedded function
 // memory page that requires a bank-switch + page-address sequence to access.
@@ -116,8 +113,8 @@ static bool imuWriteEmbeddedFuncReg( uint16_t addr, uint8_t val )
 }
 
 // Initialises the LSM6DSO and enables accelerometer, gyroscope, and pedometer.
-// Also lowers the pedometer debounce threshold from the chip default (~11 steps).
-void imuInit()
+// pedometerDebounceSteps sets the number of consecutive steps before counting begins.
+void imuInit( uint8_t pedometerDebounceSteps )
 {
     if( imuSensor.begin() != LSM6DSO_OK )
         DBG( "IMU", "ERROR: begin() failed - check I2C wiring/address" );
@@ -138,7 +135,7 @@ void imuInit()
     uint8_t defaultDebounce = 0;
     imuReadEmbeddedFuncReg( REG_PEDO_DEB_STEPS_CONF, &defaultDebounce );
     DBG( "IMU", "Pedometer debounce default = %u steps", defaultDebounce );
-    imuWriteEmbeddedFuncReg( REG_PEDO_DEB_STEPS_CONF, IMU_PEDO_DEBOUNCE_STEPS );
+    imuWriteEmbeddedFuncReg( REG_PEDO_DEB_STEPS_CONF, pedometerDebounceSteps );
 
     uint8_t verifyDebounce = 0;
     imuReadEmbeddedFuncReg( REG_PEDO_DEB_STEPS_CONF, &verifyDebounce );
@@ -232,3 +229,94 @@ bool imuCheckTiltEvent()
         return false;
     return status.TiltStatus != 0;
 }
+
+// Sets the gyroscope ODR to 0 (power-down mode). The accelerometer, pedometer,
+// and tilt detection continue running unaffected.
+void imuDisableGyro()
+{
+    if( imuSensor.Disable_G() != LSM6DSO_OK )
+        DBG( "IMU", "ERROR: Disable_G() failed" );
+    else
+        DBG( "IMU", "Gyroscope disabled" );
+}
+
+// Re-enables the gyroscope at its previously configured ODR (26 Hz, ±250 dps).
+void imuEnableGyro()
+{
+    if( imuSensor.Enable_G() != LSM6DSO_OK )
+        DBG( "IMU", "ERROR: Enable_G() failed" );
+    else
+        DBG( "IMU", "Gyroscope enabled" );
+}
+
+// FSM WRIST-TILT IMPLEMENTATION (disabled — axis mapping unverified for this mounting)
+// Source: ST MEMS FSM repository, examples/wrist_tilt_detection_xl_gy/lsm6dso (right wrist)
+// To re-enable: uncomment, declare in lsm6dso.h, call instead of imuEnableTiltDetection()
+// in setup(), remove imuDisableGyro/imuEnableGyro from powerManager.cpp, and set
+// WAKE_FSM_ONLY in main.cpp once gesture detection is validated on this hardware.
+//
+// Note: the FSM config zeros EMB_FUNC_EN_A (disabling the pedometer). After loading,
+// restore PEDO_EN with direct register writes rather than Enable_Pedometer() to avoid
+// algorithm re-initialization side effects:
+//   imuWriteReg( REG_FUNC_CFG_ACCESS, 0x80 );
+//   imuWriteReg( 0x04, 0x08 );   // EMB_FUNC_EN_A: PEDO_EN = bit 3
+//   imuWriteReg( REG_FUNC_CFG_ACCESS, 0x00 );
+//
+// bool imuEnableFsmWristTilt()
+// {
+//     static const uint8_t IMU_FSM_CONFIG[][ 2 ] = {
+//         { 0x10, 0x00 }, { 0x11, 0x00 }, { 0x01, 0x80 },
+//         { 0x04, 0x00 }, { 0x05, 0x00 }, { 0x5F, 0x53 },
+//         { 0x46, 0x01 }, { 0x47, 0x00 }, { 0x0A, 0x00 },
+//         { 0x0B, 0x01 }, { 0x0C, 0x00 }, { 0x0E, 0x00 },
+//         { 0x0F, 0x00 }, { 0x10, 0x00 }, { 0x17, 0x40 },
+//         { 0x09, 0x00 }, { 0x02, 0x11 }, { 0x08, 0x7A },
+//         { 0x09, 0x00 }, { 0x09, 0x00 }, { 0x09, 0x01 },
+//         { 0x09, 0x01 }, { 0x09, 0x00 }, { 0x09, 0x04 },
+//         { 0x02, 0x41 }, { 0x08, 0x00 },
+//         { 0x09, 0xB1 }, { 0x09, 0x30 }, { 0x09, 0x34 },
+//         { 0x09, 0x00 }, { 0x09, 0x1D }, { 0x09, 0x00 },
+//         { 0x09, 0x96 }, { 0x09, 0x31 }, { 0x09, 0x00 },
+//         { 0x09, 0xB8 }, { 0x09, 0x80 }, { 0x09, 0x00 },
+//         { 0x09, 0x20 }, { 0x09, 0x00 }, { 0x09, 0x40 },
+//         { 0x09, 0x00 }, { 0x09, 0xEC }, { 0x09, 0x24 },
+//         { 0x09, 0x00 }, { 0x09, 0x00 }, { 0x09, 0x00 },
+//         { 0x09, 0x00 }, { 0x09, 0x00 }, { 0x09, 0x00 },
+//         { 0x09, 0x00 }, { 0x09, 0x00 }, { 0x09, 0x00 },
+//         { 0x09, 0x08 }, { 0x09, 0x00 }, { 0x09, 0x66 },
+//         { 0x09, 0xAA }, { 0x09, 0x96 }, { 0x09, 0x31 },
+//         { 0x09, 0x23 }, { 0x09, 0x01 }, { 0x09, 0xA5 },
+//         { 0x09, 0xFF }, { 0x09, 0x42 }, { 0x09, 0x0A },
+//         { 0x09, 0xAA }, { 0x09, 0x96 }, { 0x09, 0x39 },
+//         { 0x09, 0x23 }, { 0x09, 0x07 }, { 0x09, 0xA5 },
+//         { 0x09, 0x23 }, { 0x09, 0x00 }, { 0x09, 0x77 },
+//         { 0x09, 0x83 }, { 0x09, 0x88 }, { 0x09, 0x86 },
+//         { 0x09, 0x22 },
+//         { 0x04, 0x00 }, { 0x05, 0x01 }, { 0x17, 0x00 },
+//         { 0x01, 0x00 }, { 0x01, 0x00 }, { 0x02, 0x3F },
+//         { 0x07, 0x00 }, { 0x08, 0x00 }, { 0x09, 0x00 },
+//         { 0x0A, 0x00 }, { 0x0B, 0x00 }, { 0x0C, 0x00 },
+//         { 0x0D, 0x00 }, { 0x0E, 0x00 },
+//         { 0x10, 0x3C }, { 0x11, 0x3C }, { 0x12, 0x04 },
+//         { 0x13, 0x00 }, { 0x14, 0x00 }, { 0x15, 0x10 },
+//         { 0x16, 0x80 }, { 0x17, 0x00 }, { 0x18, 0xE0 },
+//         { 0x19, 0x00 },
+//         { 0x56, 0x00 }, { 0x57, 0x00 }, { 0x58, 0x00 },
+//         { 0x59, 0x00 }, { 0x5A, 0x00 }, { 0x5B, 0x00 },
+//         { 0x5C, 0x00 }, { 0x5D, 0x00 }, { 0x5E, 0x02 },
+//         { 0x5F, 0x00 },
+//         { 0x6F, 0x00 }, { 0x70, 0x00 }, { 0x71, 0x00 },
+//         { 0x72, 0x00 }, { 0x73, 0x00 }, { 0x74, 0x00 },
+//         { 0x75, 0x00 },
+//     };
+//     static const uint16_t IMU_FSM_CONFIG_LEN =
+//         sizeof( IMU_FSM_CONFIG ) / sizeof( IMU_FSM_CONFIG[ 0 ] );
+//     for( uint16_t i = 0; i < IMU_FSM_CONFIG_LEN; i++ )
+//         imuWriteReg( IMU_FSM_CONFIG[ i ][ 0 ], IMU_FSM_CONFIG[ i ][ 1 ] );
+//     imuWriteReg( REG_FUNC_CFG_ACCESS, 0x80 );
+//     imuWriteReg( 0x04, 0x08 );
+//     imuWriteReg( REG_FUNC_CFG_ACCESS, 0x00 );
+//     DBG( "IMU", "FSM wrist-tilt loaded (%u writes), pedometer re-enabled, INT1 armed",
+//         IMU_FSM_CONFIG_LEN );
+//     return true;
+// }

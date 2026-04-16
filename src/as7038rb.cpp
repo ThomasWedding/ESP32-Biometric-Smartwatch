@@ -343,23 +343,11 @@ static void ppgComputeSpO2()
 }
 
 // Initialises the AS7038RB: enables LDO/oscillator, configures LEDs, PDs, OFE, ADC, and sequencer.
-void ppgInit( TwoWire& wire )
+// Writes all peripheral register configuration (LEDs, PDs, OFE, ADC, sequencer).
+// Called from ppgInit() on first boot and from ppgPowerUp() after each LDO-off cycle,
+// because the chip's volatile registers reset when the internal LDO is off.
+static void ppgConfigure()
 {
-    ppgI2cBus      = &wire;
-    ppgWriteIndex  = 0;
-    ppgSampleCount = 0;
-    ppgResultsValid = false;
-
-    DBG( "PPG", "Init: enabling LDO + oscillator" );
-
-    // Enable internal LDO and oscillator; datasheet Ton = 35 ms
-    ppgWriteReg( REG_CONTROL, CTRL_LDO_EN | CTRL_OSC_EN );
-    delay( 40 );
-
-    // Verify chip ID
-    uint8_t chipId = ppgReadReg( REG_ID );
-    DBG( "PPG", "Chip ID=0x%02X (expected 0x44)", chipId );
-
     // Enable LED1 (red), LED2 (IR), and LED3 (green), plus signal reference
     ppgWriteReg( REG_LED_CFG, LED_CFG_SIGREF_EN | LED_CFG_LED3_EN | LED_CFG_LED2_EN | LED_CFG_LED1_EN );
 
@@ -401,6 +389,27 @@ void ppgInit( TwoWire& wire )
     ppgWriteReg( REG_SEQ_LED_STO, 0x40 );
     ppgWriteReg( REG_SEQ_ADC,     0x60 );
 
+    DBG( "PPG", "Registers configured (LEDs, PDs, OFE, ADC, sequencer)" );
+}
+
+void ppgInit( TwoWire& wire )
+{
+    ppgI2cBus      = &wire;
+    ppgWriteIndex  = 0;
+    ppgSampleCount = 0;
+    ppgResultsValid = false;
+
+    DBG( "PPG", "Init: enabling LDO + oscillator" );
+
+    // Enable internal LDO and oscillator; datasheet Ton = 35 ms
+    ppgWriteReg( REG_CONTROL, CTRL_LDO_EN | CTRL_OSC_EN );
+    delay( 40 );
+
+    // Verify chip ID
+    uint8_t chipId = ppgReadReg( REG_ID );
+    DBG( "PPG", "Chip ID=0x%02X (expected 0x44)", chipId );
+
+    ppgConfigure();
     DBG( "PPG", "Init complete - sequencer configured for ~100 Hz" );
 }
 
@@ -554,10 +563,12 @@ void ppgPowerDown()
     ppgWriteReg( REG_CONTROL, 0x00 );
 }
 
-// Re-enables the LDO and oscillator; waits 40 ms for the chip to stabilise.
+// Re-enables the LDO and oscillator, waits for stabilisation, then reloads all
+// peripheral registers. Leaves the sensor ready for ppgStartSampling().
 void ppgPowerUp()
 {
     DBG( "PPG", "Powering up (LDO+OSC on, waiting 40 ms)" );
     ppgWriteReg( REG_CONTROL, CTRL_LDO_EN | CTRL_OSC_EN );
     delay( 40 );  // datasheet Ton = 35 ms
+    ppgConfigure();
 }

@@ -28,14 +28,15 @@ static const char* HRS_BODY_LOCATION_UUID = "2A38";  // Body Sensor Location (RE
 static const char* BLE_CHAR_TIME_WRITE_UUID   = "C1B2D3E4-F5A6-7890-BCDE-012345678901";
 static const char* BLE_CHAR_TIME_REQUEST_UUID = "D1E2F3A4-B5C6-7890-CDEF-123456789012";
 
-// Packed payload sent as a single NOTIFY per reading (14 bytes, little-endian)
+// Packed payload sent as a single NOTIFY per reading (19 bytes, little-endian)
 struct __attribute__((packed)) BlePayload {
-    uint32_t timestamp;  // millis() at time of reading
-    uint16_t heartRate;  // BPM
-    uint8_t  spo2;       // 0–100 %
-    uint16_t hrv;        // RMSSD ms
-    uint32_t stepCount;  // cumulative
-    uint8_t  valid;      // 1 = valid reading
+    uint64_t timestamp;      // Unix epoch ms (if timestampType=1) or millis() (if timestampType=0)
+    uint16_t heartRate;      // BPM
+    uint8_t  spo2;           // 0–100 %
+    uint16_t hrv;            // RMSSD ms
+    uint32_t stepCount;      // cumulative
+    uint8_t  valid;          // 1 = valid reading
+    uint8_t  timestampType;  // 0 = millis(), 1 = Unix epoch ms
 };
 
 static const char* DEVICE_NAME = "Biowatch";
@@ -50,7 +51,13 @@ static bool bleConnected = false;
 
 // True once Android has sent a valid timestamp; RTC_DATA_ATTR preserves the flag
 // across deep sleep so the watch knows it has valid time when it wakes.
-static RTC_DATA_ATTR bool bleRtcSynced = false;
+static RTC_DATA_ATTR bool     bleRtcSynced      = false;
+
+// Anchor values saved at the moment of the first (and each subsequent) time sync.
+// Used to back-convert pre-sync millis() timestamps to Unix ms for buffered readings.
+// Both are RTC_DATA_ATTR so the anchor survives deep sleep alongside bleRtcSynced.
+static RTC_DATA_ATTR uint64_t bleSyncEpochMs    = 0;   // Unix epoch ms at time of sync
+static RTC_DATA_ATTR uint32_t bleSyncMillis      = 0;   // millis() at time of sync
 
 // Maps HCI disconnect reason codes to human-readable strings.
 static const char* bleHciReasonStr( int reason )
@@ -153,7 +160,12 @@ class BleTimeWriteCallbacks : public NimBLECharacteristicCallbacks
         tv.tv_sec  = ( time_t )epoch;
         tv.tv_usec = 0;
         settimeofday( &tv, nullptr );
-        bleRtcSynced = true;
+
+        // Save the sync anchor so pre-sync millis() timestamps in buffered readings
+        // can be back-converted to Unix ms at flush time.
+        bleSyncEpochMs = epoch * 1000ULL;
+        bleSyncMillis  = ( uint32_t )millis();
+        bleRtcSynced   = true;
 
         struct tm tmInfo;
         gmtime_r( &tv.tv_sec, &tmInfo );
@@ -189,7 +201,7 @@ void bleInit()
 
     NimBLEService* bleBioService = bleServer -> createService( BLE_SERVICE_UUID );
 
-    // Single packed readings characteristic. 14-byte BlePayload, NOTIFY + READ
+    // Single packed readings characteristic. 19-byte BlePayload, NOTIFY + READ
     bleReadingsChar = bleBioService -> createCharacteristic(
         BLE_CHAR_READINGS_UUID,
         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
@@ -259,6 +271,21 @@ bool bleIsConnected()
     return bleConnected;
 }
 
+// Returns true if the RTC has been synced at least once via BLE time-sync.
+bool bleIsTimeSynced()
+{
+    return bleRtcSynced;
+}
+
+// Returns the current time as Unix epoch milliseconds.
+// Only call this after bleIsTimeSynced() returns true; result is undefined otherwise.
+uint64_t bleGetUnixMs()
+{
+    struct timeval tv;
+    gettimeofday( &tv, nullptr );
+    return ( uint64_t )tv.tv_sec * 1000ULL + ( uint64_t )tv.tv_usec / 1000ULL;
+}
+
 // Notifies the time-request characteristic to prompt Android to send the current time.
 // Android should respond by writing an 8-byte Unix timestamp to the time-write characteristic.
 void bleRequestTimeSync()
@@ -308,22 +335,25 @@ void bleSendReading( const BiometricReading& reading )
     if( !bleConnected ) return;
 
     BlePayload payload;
-    payload.timestamp = reading.timestamp;
-    payload.heartRate = reading.heartRate;
-    payload.spo2      = reading.spo2;
-    payload.hrv       = reading.hrv;
-    payload.stepCount = reading.stepCount;
-    payload.valid     = reading.valid ? 1 : 0;
+    payload.timestamp     = reading.timestamp;
+    payload.heartRate     = reading.heartRate;
+    payload.spo2          = reading.spo2;
+    payload.hrv           = reading.hrv;
+    payload.stepCount     = reading.stepCount;
+    payload.valid         = reading.valid ? 1 : 0;
+    payload.timestampType = reading.timestampIsUnix ? 1 : 0;
 
     bleReadingsChar -> setValue( reinterpret_cast<uint8_t*>( &payload ), sizeof( payload ) );
     bool bleSent = bleReadingsChar -> notify();
     if( bleSent )
     {
-        DBG( "BLE", "Sent - ts=%lu  bpm=%u  spo2=%u  hrv=%u  steps=%lu",
-            reading.timestamp, reading.heartRate, reading.spo2,
+        DBG( "BLE", "Sent - ts=%llu (type=%s)  bpm=%u  spo2=%u  hrv=%u  steps=%lu",
+            ( unsigned long long )reading.timestamp,
+            reading.timestampIsUnix ? "unix" : "millis",
+            reading.heartRate, reading.spo2,
             reading.hrv, ( unsigned long )reading.stepCount );
     } else {
-        DBG( "BLE", "notify() failed - dropped reading ts=%lu", reading.timestamp );
+        DBG( "BLE", "notify() failed - dropped reading ts=%llu", ( unsigned long long )reading.timestamp );
     }
 
     // Also update the standard Heart Rate Measurement characteristic.
@@ -339,11 +369,22 @@ void bleSendReading( const BiometricReading& reading )
 }
 
 // Drains all buffered readings and sends them to the connected central.
+// If time is synced, any pre-sync millis() timestamps are back-converted to Unix ms
+// using the anchor saved at sync time before the reading is transmitted.
 void bleFlushBuffer()
 {
     BiometricReading reading;
     while( bufPop( reading ) )
     {
+        if( bleRtcSynced && !reading.timestampIsUnix )
+        {
+            // Convert millis() timestamp to Unix ms. The difference can be negative
+            // (reading taken before sync) or positive (reading taken after sync but
+            // before the first flush), both handled correctly by signed arithmetic.
+            int64_t offsetMs      = ( int64_t )reading.timestamp - ( int64_t )bleSyncMillis;
+            reading.timestamp     = ( uint64_t )( ( int64_t )bleSyncEpochMs + offsetMs );
+            reading.timestampIsUnix = true;
+        }
         bleSendReading( reading );
     }
 }
