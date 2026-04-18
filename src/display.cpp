@@ -17,10 +17,10 @@ static const uint16_t DISP_HEIGHT = 135;
 // Colour palette
 static const uint16_t DISP_COLOR_BG      = ST77XX_BLACK;
 static const uint16_t DISP_COLOR_TITLE   = ST77XX_WHITE;
-static const uint16_t DISP_COLOR_HR      = ST77XX_GREEN;
-static const uint16_t DISP_COLOR_SPO2    = ST77XX_CYAN;
-static const uint16_t DISP_COLOR_HRV     = ST77XX_YELLOW;
-static const uint16_t DISP_COLOR_STEPS   = ST77XX_WHITE;
+static const uint16_t DISP_COLOR_HR      = 0xE8EC; // #E91E63 pink
+static const uint16_t DISP_COLOR_SPO2    = 0x24BF; // #2196FE blue
+static const uint16_t DISP_COLOR_HRV     = 0x9936; // #9C26B0 purple
+static const uint16_t DISP_COLOR_STEPS   = 0x4D6A; // #4CAF50 green
 static const uint16_t DISP_COLOR_BLE_ON  = ST77XX_BLUE;
 static const uint16_t DISP_COLOR_BLE_OFF = 0x4208; // dark grey
 

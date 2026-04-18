@@ -19,7 +19,7 @@ bool debugSerialEnabled = true;
 //   3 - IMU sensor test: only LSM6DSO is initialized
 //   4 - real PPG + dummy IMU
 //   5 - real IMU + dummy PPG
-#define TESTING_MODE 2
+#define TESTING_MODE 0
 
 static const uint32_t SAMPLE_WINDOW_MS   = 15000; // duration of each PPG acquisition
 static const uint32_t SAMPLE_INTERVAL_MS = 45000; // idle period between acquisitions
@@ -28,7 +28,7 @@ static const uint32_t SAMPLE_INTERVAL_MS = 45000; // idle period between acquisi
 // Once Android sends a timestamp, bleGetCurrentTime() is used instead and these values
 // are no longer shown.
 static const uint8_t  CLOCK_MONTH  = 4;
-static const uint8_t  CLOCK_DAY    = 10;
+static const uint8_t  CLOCK_DAY    = 18;
 static const uint16_t CLOCK_YEAR   = 2026;
 static const uint8_t  CLOCK_HOUR   = 12;
 static const uint8_t  CLOCK_MINUTE = 0;
@@ -37,7 +37,7 @@ static const bool     CLOCK_IS_PM  = true;
 
 // How often to request a time sync from Android while connected.
 // Reduce for testing; 30 minutes is a reasonable production value.
-static const uint32_t TIME_SYNC_INTERVAL_MS = 60000; // 1 minute (testing default)
+static const uint32_t TIME_SYNC_INTERVAL_MS = 600000; // 1 minute (testing default)
 
 // Screen auto-off & lift-to-wake configuration
 static const uint32_t SCREEN_TIMEOUT_MS       = 30000; // screen off after 30 s of inactivity
@@ -48,13 +48,13 @@ static const bool     AUTO_SCREEN_OFF_ENABLED = true;  // set false to keep scre
 // Should be tuned based on the physical orientation of the IMU on the wrist.
 static const float WAKE_ACCEL_X_MIN = -0.7f;
 static const float WAKE_ACCEL_X_MAX =  0.7f;
-static const float WAKE_ACCEL_Y_MIN = -0.4f;
+static const float WAKE_ACCEL_Y_MIN =  -0.4f;
 static const float WAKE_ACCEL_Y_MAX =  0.3f;
 static const float WAKE_ACCEL_Z_MIN = -1.0f;
 static const float WAKE_ACCEL_Z_MAX = -0.3f;
 
 // Number of consecutive steps required before the pedometer starts counting.
-static const uint8_t IMU_PEDO_DEBOUNCE_STEPS = 10;
+static const uint8_t IMU_PEDO_DEBOUNCE_STEPS = 8;
 
 // Hardware pins
 static const int BUTTON_D0_PIN = 0;  // GPIO0 - boot button, active LOW
@@ -68,6 +68,15 @@ static volatile bool tiltWakeFlag   = false;
 
 // Whether the IMU is initialized in the current testing mode
 static bool imuAvailable = false;
+
+// Last known sensor/battery readings shared between sensorTask and screenTask.
+// Written by sensorTask; read by screenTask for clock-only display refreshes.
+static volatile uint16_t lastBpm      = 0;
+static volatile uint8_t  lastSpo2     = 0;
+static volatile uint16_t lastHrv      = 0;
+static volatile uint32_t lastSteps    = 0;
+static volatile int8_t   lastBatPct   = -1;
+static volatile bool     lastCharging = false;
 
 // ISR triggered on FALLING edge of button D0 (active LOW).
 static void IRAM_ATTR buttonD0Isr()
@@ -122,11 +131,9 @@ static void sensorTask( void* pvParameters )
 
 #elif TESTING_MODE == 4
         // Real PPG + dummy IMU
-        DBG( "MAIN", "Starting PPG sampling for %lu ms", ( unsigned long )SAMPLE_WINDOW_MS );
-        ppgStartSampling();
-        vTaskDelay( pdMS_TO_TICKS( SAMPLE_WINDOW_MS ) );
-        ppgStopSampling();
-        DBG( "MAIN", "PPG sampling complete" );
+        DBG( "MAIN", "Starting PPG collection (%lu ms per pass)", ( unsigned long )SAMPLE_WINDOW_MS );
+        ppgCollectSamples( SAMPLE_WINDOW_MS );
+        DBG( "MAIN", "PPG collection complete" );
 
         ppgGetHeartRate( &bpm );
         ppgGetSpO2( &spo2 );
@@ -154,12 +161,11 @@ static void sensorTask( void* pvParameters )
         DBG( "MAIN", "Enabling sensors" );
         pmEnableSensors();
 
-        // Collect PPG samples for SAMPLE_WINDOW_MS; algorithms run internally
-        DBG( "MAIN", "Starting PPG sampling for %lu ms", ( unsigned long )SAMPLE_WINDOW_MS );
-        ppgStartSampling();
-        vTaskDelay( pdMS_TO_TICKS( SAMPLE_WINDOW_MS ) );
-        ppgStopSampling();
-        DBG( "MAIN", "PPG sampling complete" );
+        // Run 3-pass PPG collection (green → red → IR), each pass durationMs.
+        // Mid-window FIFO draining is handled internally by ppgCollectSamples.
+        DBG( "MAIN", "Starting PPG collection (%lu ms per pass)", ( unsigned long )SAMPLE_WINDOW_MS );
+        ppgCollectSamples( SAMPLE_WINDOW_MS );
+        DBG( "MAIN", "PPG collection complete" );
 
         ppgGetHeartRate( &bpm );
         ppgGetSpO2( &spo2 );
@@ -190,6 +196,15 @@ static void sensorTask( void* pvParameters )
         // Update display (-1 if battery unavailable, 100% if plugged in with no battery)
         int8_t batPct   = ( int8_t )batGetPercent();
         bool   charging = batIsCharging();
+
+        // Cache latest values so screenTask can refresh the clock every second
+        lastBpm      = bpm;
+        lastSpo2     = spo2;
+        lastHrv      = hrv;
+        lastSteps    = steps;
+        lastBatPct   = batPct;
+        lastCharging = charging;
+
         dispUpdateMetrics( bpm, spo2, hrv, steps, bleIsConnected(), batPct, charging,
                            clkMonth, clkDay, clkYear,
                            clkHour, clkMinute, clkSecond, clkIsPm );
@@ -249,7 +264,7 @@ static void bleTask( void* pvParameters )
         if( connected )
         {
             // Initial request fires ~1 s after connect so Android can subscribe first
-            if( !initialSyncSent && ( millis() - connectedSinceMs >= 1000 ) )
+            if( !initialSyncSent && ( millis() - connectedSinceMs >= 3000 ) )
             {
                 bleRequestTimeSync();
                 lastTimeSyncMs  = millis();
@@ -338,6 +353,7 @@ static void screenTask( void* pvParameters )
 {
     bool     screenOn         = true;
     uint32_t lastActivityTime = millis();
+    uint32_t lastClockRefresh = 0;
 
     for( ;; )
     {
@@ -359,6 +375,9 @@ static void screenTask( void* pvParameters )
         {
             tiltWakeFlag = false;
             DBG( "MAIN", "Tilt triggered via GPIO interrupt" );
+
+            // Wait for arm to settle before sampling; tilt fires mid-gesture.
+            vTaskDelay( pdMS_TO_TICKS( 300 ) );
 
             float ax = 0.0f, ay = 0.0f, az = 0.0f;
             bool accelOk = imuGetAcceleration( &ax, &ay, &az );
@@ -389,6 +408,23 @@ static void screenTask( void* pvParameters )
             DBG( "MAIN", "Screen off: timeout (%lu ms)", ( unsigned long )SCREEN_TIMEOUT_MS );
             dispSleep();
             screenOn = false;
+        }
+
+        // Refresh the clock on the display every 10 s using the RTC, independent
+        // of the sensor cycle. Uses the last known metrics from sensorTask.
+        if( screenOn && ( millis() - lastClockRefresh >= 10000 ) )
+        {
+            uint8_t  clkMonth  = CLOCK_MONTH,  clkDay    = CLOCK_DAY;
+            uint16_t clkYear   = CLOCK_YEAR;
+            uint8_t  clkHour   = CLOCK_HOUR,   clkMinute = CLOCK_MINUTE;
+            uint8_t  clkSecond = CLOCK_SECOND;
+            bool     clkIsPm   = CLOCK_IS_PM;
+            bleGetCurrentTime( &clkMonth, &clkDay, &clkYear, &clkHour, &clkMinute, &clkSecond, &clkIsPm );
+            dispUpdateMetrics( lastBpm, lastSpo2, lastHrv, lastSteps, bleIsConnected(),
+                               lastBatPct, lastCharging,
+                               clkMonth, clkDay, clkYear,
+                               clkHour, clkMinute, clkSecond, clkIsPm );
+            lastClockRefresh = millis();
         }
 
         vTaskDelay( pdMS_TO_TICKS( 100 ) );
@@ -427,7 +463,7 @@ void setup()
     imuInit( IMU_PEDO_DEBOUNCE_STEPS );
     imuEnableTiltDetection();
     imuAvailable = true;
-    ppgInit();
+    ppgInit( Wire );
     bleInit();
 
     // IMU INT1 interrupt for lift-to-wake

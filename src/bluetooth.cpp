@@ -219,7 +219,7 @@ void bleInit()
     // prompt Android to write the current time to bleTimeWriteChar.
     bleTimeRequestChar = bleBioService -> createCharacteristic(
         BLE_CHAR_TIME_REQUEST_UUID,
-        NIMBLE_PROPERTY::NOTIFY
+        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
     );
 
     // Device Information Service. Standard BLE service that Android system
@@ -389,10 +389,12 @@ void bleFlushBuffer()
     }
 }
 
-// Flushes the buffer if connected and readings are pending. Called periodically by bleTask.
+// Flushes the buffer if connected, time-synced, and readings are pending.
+// Holds the buffer until the first time sync completes so Android never
+// receives a millis()-based timestamp. Called periodically by bleTask.
 void bleProcess()
 {
-    if( bleConnected && !bufIsEmpty() )
+    if( bleConnected && bleRtcSynced && !bufIsEmpty() )
     {
         bleFlushBuffer();
     }

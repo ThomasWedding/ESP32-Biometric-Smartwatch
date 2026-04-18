@@ -3,8 +3,9 @@
 #include <Arduino.h>
 #include <math.h>
 
-// AS7038RB I2C address (fixed, no address-select pin)
-static const uint8_t AS7038RB_I2C_ADDR = 0x60;
+// AS7038RB I2C address (fixed, no address-select pin).
+// 7-bit address used by Arduino Wire (Wire shifts left internally to produce the 8-bit 0x60 on the bus).
+static const uint8_t AS7038RB_I2C_ADDR = 0x30;
 
 // Register map - addresses from AS7038RB datasheet DS000726 v2-00, section 6
 // Core control / ID
@@ -46,7 +47,7 @@ static const uint8_t REG_SEQ_ADC     = 0x42; // ADC sampling time within sequenc
 static const uint8_t REG_ADC_CFGA             = 0x88; // adc_multi_n[2:0] D2:D0, adc_multi_imode D3 (wait, D0)
 static const uint8_t REG_ADC_CFGB             = 0x89; // adc_en D0, ulp D1, adc_calibration D2, adc_clock[2:0] D5:D3
 static const uint8_t REG_ADC_CFGC             = 0x8A; // adc_settling_time[2:0] D2:D0, adc_discharge D3, adc_self_pd D4
-static const uint8_t REG_ADC_CHANNEL_MASK_L   = 0x8B; // tia D0, ofe1 D1, ofe2 D2, sd1 D3, sd2 D4, temp D5, afe D6, pregain D7
+static const uint8_t REG_ADC_CHANNEL_MASK_L   = 0x8B; // tia D0, ofe1 D1, sd1 D2, ofe2 D3, sd2 D4, temp D5, afe D6, pregain D7
 static const uint8_t REG_ADC_CHANNEL_MASK_H   = 0x8C; // ecgo D0, ecgi D1, gpio2 D2, gpio3 D3
 static const uint8_t REG_ADC_DATA_L           = 0x8E; // adc_data[7:0]
 static const uint8_t REG_ADC_DATA_H           = 0x8F; // adc_data[13:8] in D5:D0
@@ -101,7 +102,23 @@ static const uint8_t ADC_CFGB_ADC_EN = 0x01; // D0 - enable ADC
 
 // ADC channel mask bits (REG_ADC_CHANNEL_MASK_L 0x8B)
 static const uint8_t ADC_MASK_OFE1 = 0x02; // D1 - capture OFE1
-static const uint8_t ADC_MASK_OFE2 = 0x04; // D2 - capture OFE2
+static const uint8_t ADC_MASK_OFE2 = 0x08; // D3 - capture OFE2
+
+// MAN_SEQ_CFG register (REG_MAN_SEQ_CFG 0x2E)
+static const uint8_t REG_MAN_SEQ_CFG    = 0x2E; // man_seq_cfg: seq_en D0
+static const uint8_t MAN_SEQ_CFG_SEQ_EN = 0x01; // D0 - enable sequencer (default 0 = disabled)
+
+// LED12_MODE sequencer fire modes for led1 (D2:D0) and led2 (D5:D3).
+// LED34_MODE sequencer fire mode for led3 (D2:D0).
+// 010 = fire every sequence; 000 = always off.
+static const uint8_t LED1_MODE_SEQUENCER = 0x02; // led1_mode=010 in D2:D0 of LED12_MODE
+static const uint8_t LED2_MODE_SEQUENCER = 0x10; // led2_mode=010 in D5:D3 of LED12_MODE (010 << 3)
+static const uint8_t LED3_MODE_SEQUENCER = 0x02; // led3_mode=010 in D2:D0 of LED34_MODE
+
+// FIFO drain interval used during multi-pass sampling.
+// FIFO max depth is 127 entries; at 100 Hz (1 OFE channel) it fills in ~1.27 s.
+// Draining every 800 ms keeps the FIFO comfortably below overflow.
+static const uint32_t PPG_DRAIN_INTERVAL_MS = 800;
 
 // SEQ_START register bit masks (REG_SEQ_START 0x32)
 static const uint8_t SEQ_START_BIT = 0x01; // D0
@@ -158,6 +175,54 @@ static uint16_t ppgReadReg16( uint8_t highReg, uint8_t lowReg )
     uint16_t high = ppgReadReg( highReg );
     uint16_t low  = ppgReadReg( lowReg );
     return ( uint16_t )( ( high << 8 ) | low );
+}
+
+// Reads all available FIFO entries into buffer starting at *count; updates *count.
+// Silently stops filling when *count reaches maxCount; returns number of entries drained.
+static uint16_t ppgDrainFifoInto( uint32_t* buffer, uint16_t* count, uint16_t maxCount )
+{
+    uint8_t  level   = ppgReadReg( REG_FIFOLEVEL );
+    uint16_t drained = 0;
+    for( uint8_t i = 0; i < level && *count < maxCount; i++ )
+    {
+        uint8_t  lo             = ppgReadReg( REG_FIFOL );
+        uint8_t  hi             = ppgReadReg( REG_FIFOH ) & 0x3F;
+        buffer[ (*count)++ ]    = ( uint32_t )( ( ( uint16_t )hi << 8 ) | lo );
+        drained++;
+    }
+    return drained;
+}
+
+// Activates one LED, runs the sequencer for durationMs with periodic FIFO draining, then stops.
+// ledCfgBits is OR'd with LED_CFG_SIGREF_EN; ledMode12/34 set LED12_MODE and LED34_MODE.
+// Accumulated samples are appended to buffer starting at *count.
+static void ppgRunPass( uint8_t ledCfgBits, uint8_t ledMode12, uint8_t ledMode34,
+                        uint32_t* buffer, uint16_t* count, uint16_t maxCount,
+                        uint32_t durationMs )
+{
+    // Switch to this LED; all sequencer timing registers remain from ppgConfigure()
+    ppgWriteReg( REG_LED_CFG,    LED_CFG_SIGREF_EN | ledCfgBits );
+    ppgWriteReg( REG_LED12_MODE, ledMode12 );
+    ppgWriteReg( REG_LED34_MODE, ledMode34 );
+
+    // Clear FIFO and start
+    ppgWriteReg( REG_FIFO_CNTRL, 0x01 );
+    ppgWriteReg( REG_FIFO_CNTRL, 0x00 );
+    ppgWriteReg( REG_SEQ_START,  SEQ_START_BIT );
+
+    // Drain periodically to prevent overflow, then do a final drain after stopping
+    uint32_t elapsed = 0;
+    while( elapsed < durationMs )
+    {
+        uint32_t sleepMs = durationMs - elapsed;
+        if( sleepMs > PPG_DRAIN_INTERVAL_MS ) sleepMs = PPG_DRAIN_INTERVAL_MS;
+        delay( sleepMs );
+        elapsed += sleepMs;
+        ppgDrainFifoInto( buffer, count, maxCount );
+    }
+
+    ppgWriteReg( REG_SEQ_START, 0x00 );
+    ppgDrainFifoInto( buffer, count, maxCount );
 }
 
 // Computes the mean of an array of uint32 values.
@@ -348,19 +413,18 @@ static void ppgComputeSpO2()
 // because the chip's volatile registers reset when the internal LDO is off.
 static void ppgConfigure()
 {
-    // Enable LED1 (red), LED2 (IR), and LED3 (green), plus signal reference
-    ppgWriteReg( REG_LED_CFG, LED_CFG_SIGREF_EN | LED_CFG_LED3_EN | LED_CFG_LED2_EN | LED_CFG_LED1_EN );
+    // LED_CFG: enable all three LEDs and signal reference.
+    // ppgRunPass() selects which LED actually fires each pass by writing LED12_MODE/LED34_MODE;
+    // this register just enables the driver sources so current can flow when the sequencer fires.
+    ppgWriteReg( REG_LED_CFG, LED_CFG_SIGREF_EN | LED_CFG_LED1_EN | LED_CFG_LED2_EN | LED_CFG_LED3_EN );
 
-    // Set LED1 (red) current to ~10 mA
+    // Set all LED currents to ~10 mA.
+    // Current registers are non-volatile across LED_CFG/MODE changes; must be written once here.
     // 10-bit Curr: CURRH holds Curr[9:2], CURRL holds Curr[1:0] in D7:D6
     ppgWriteReg( REG_LED1_CURRH, ( uint8_t )( LED_CURRENT_10MA >> 2 ) );
     ppgWriteReg( REG_LED1_CURRL, ( uint8_t )( ( LED_CURRENT_10MA & 0x03 ) << 6 ) );
-
-    // Set LED2 (IR) to the same current
     ppgWriteReg( REG_LED2_CURRH, ( uint8_t )( LED_CURRENT_10MA >> 2 ) );
     ppgWriteReg( REG_LED2_CURRL, ( uint8_t )( ( LED_CURRENT_10MA & 0x03 ) << 6 ) );
-
-    // Set LED3 (green) to the same current
     ppgWriteReg( REG_LED3_CURRH, ( uint8_t )( LED_CURRENT_10MA >> 2 ) );
     ppgWriteReg( REG_LED3_CURRL, ( uint8_t )( ( LED_CURRENT_10MA & 0x03 ) << 6 ) );
 
@@ -370,26 +434,34 @@ static void ppgConfigure()
     // Enable transimpedance amplifier
     ppgWriteReg( REG_PD_AMPCFG, PD_AMP_EN );
 
-    // Enable OFE1 (red), OFE2 (IR), and OFE bias
+    // Enable OFE1 and OFE bias; OFE2 kept enabled as a fallback (harmless when only OFE1 is sampled)
     ppgWriteReg( REG_OFE_CFGA, OFE_CFG_OFE2_EN | OFE_CFG_OFE1_EN | OFE_CFG_BIAS_EN );
 
-    // Select OFE1 and OFE2 as ADC capture channels
-    ppgWriteReg( REG_ADC_CHANNEL_MASK_L, ADC_MASK_OFE1 | ADC_MASK_OFE2 );
+    // ADC captures OFE1 only — one entry per sequence, corresponding to LED1 (red)
+    ppgWriteReg( REG_ADC_CHANNEL_MASK_L, ADC_MASK_OFE1 );
 
     // Enable ADC
     ppgWriteReg( REG_ADC_CFGB, ADC_CFGB_ADC_EN );
 
-    // Sequencer: continuous run (SEQ_CNT = 0 → infinite), default clock divider and period.
-    // These values produce roughly 100 Hz PPG sample rate; tune via SEQ_DIV and SEQ_PER
-    // if a different rate is needed.
-    ppgWriteReg( REG_SEQ_CNT, 0x00 );     // infinite sequences
-    ppgWriteReg( REG_SEQ_DIV, 0xFF );     // maximum divider (~7.8 kHz tick from 2 MHz oscillator)
-    ppgWriteReg( REG_SEQ_PER, 0x4E );     // ~78 ticks per period → ~100 Hz
-    ppgWriteReg( REG_SEQ_LED_STA, 0x02 );
-    ppgWriteReg( REG_SEQ_LED_STO, 0x40 );
-    ppgWriteReg( REG_SEQ_ADC,     0x60 );
+    // Default sequencer mode: LED1 (red) fires every sequence; LED2/3 off.
+    // ppgRunPass() overrides these registers for each sampling pass.
+    ppgWriteReg( REG_LED12_MODE, LED1_MODE_SEQUENCER ); // led1_mode=010, led2_mode=000
+    ppgWriteReg( REG_LED34_MODE, 0x00 );                // led3_mode=000, led4_mode=000
 
-    DBG( "PPG", "Registers configured (LEDs, PDs, OFE, ADC, sequencer)" );
+    // Enable the sequencer (seq_en bit 0 defaults to 0; must be set before SEQ_START has effect)
+    ppgWriteReg( REG_MAN_SEQ_CFG, MAN_SEQ_CFG_SEQ_EN );
+
+    // Sequencer timing: continuous run, ~100 Hz.
+    // Period = 78 ticks (SEQ_PER=0x4E); LED on from tick 2 to 64 (62-tick window);
+    // ADC fires at tick 72 — after LED_STO(64) and before period end(78).
+    ppgWriteReg( REG_SEQ_CNT,     0x00 ); // infinite sequences
+    ppgWriteReg( REG_SEQ_DIV,     0xFF ); // maximum divider (~7.8 kHz tick from 2 MHz oscillator)
+    ppgWriteReg( REG_SEQ_PER,     0x4E ); // period = 78 ticks → ~100 Hz
+    ppgWriteReg( REG_SEQ_LED_STA, 0x02 ); // LED on at tick 2
+    ppgWriteReg( REG_SEQ_LED_STO, 0x40 ); // LED off at tick 64
+    ppgWriteReg( REG_SEQ_ADC,     0x48 ); // ADC at tick 72 (after LED_STO=64, before PER=78)
+
+    DBG( "PPG", "Registers configured (LED1 red, OFE1, ADC, sequencer enabled)" );
 }
 
 void ppgInit( TwoWire& wire )
@@ -429,57 +501,22 @@ void ppgStartSampling()
     DBG( "PPG", "Sequencer started, FIFO cleared" );
 }
 
-// Stops the sequencer, drains the FIFO into sample buffers, and runs HR/SpO2/HRV algorithms.
+// Stops the sequencer and drains any remaining FIFO entries into the red buffer.
+// Valid for single-pass use (ppgStartSampling + ppgStopSampling); for full 3-channel
+// collection use ppgCollectSamples() instead.
 void ppgStopSampling()
 {
-    // Stop sequencer
     ppgWriteReg( REG_SEQ_START, 0x00 );
-    DBG( "PPG", "Sequencer stopped, draining FIFO" );
+    DBG( "PPG", "Sequencer stopped, draining remaining FIFO" );
 
-    // Check for overflow before draining
     uint8_t fifoStatus = ppgReadReg( REG_FIFOSTATUS );
     if( fifoStatus & 0x01 )
-        DBG( "PPG", "WARNING: FIFO overflow detected - samples were lost" );
+        DBG( "PPG", "WARNING: FIFO overflow - samples were lost" );
 
-    // Drain the FIFO into PPG buffers.
-    // FIFO entries are interleaved: red (slot 0), IR (slot 1), green (slot 2) per sequence cycle.
-    // 14-bit samples: lower 8 bits from FIFOL (0xFE), upper 6 bits from FIFOH[5:0] (0xFF).
-    uint8_t fifoLevel = ppgReadReg( REG_FIFOLEVEL );
-    DBG( "PPG", "FIFO level=%u entries (%u triplets)", fifoLevel, fifoLevel / 3 );
-    ppgWriteIndex  = 0;
-    ppgSampleCount = 0;
+    ppgDrainFifoInto( ppgRedBuffer, &ppgWriteIndex, PPG_BUFFER_SIZE );
+    ppgSampleCount = ppgWriteIndex;
+    DBG( "PPG", "FIFO drain complete: %u samples", ppgSampleCount );
 
-    for( uint8_t i = 0; i < fifoLevel; i++ )
-    {
-        uint8_t  lo     = ppgReadReg( REG_FIFOL );
-        uint8_t  hi     = ppgReadReg( REG_FIFOH ) & 0x3F;
-        uint16_t sample = ( ( uint16_t )hi << 8 ) | ( uint16_t )lo;
-
-        uint8_t slot = i % 3;
-        if( slot == 0 )  // red
-        {
-            if( ppgWriteIndex < PPG_BUFFER_SIZE )
-                ppgRedBuffer[ ppgWriteIndex ] = ( uint32_t )sample;
-        }
-        else if( slot == 1 )  // IR
-        {
-            if( ppgWriteIndex < PPG_BUFFER_SIZE )
-                ppgIrBuffer[ ppgWriteIndex ] = ( uint32_t )sample;
-        }
-        else  // green
-        {
-            if( ppgWriteIndex < PPG_BUFFER_SIZE )
-            {
-                ppgGreenBuffer[ ppgWriteIndex ] = ( uint32_t )sample;
-                ppgWriteIndex++;
-                ppgSampleCount++;
-            }
-        }
-    }
-
-    DBG( "PPG", "FIFO drain complete: %u sample triplets collected", ppgSampleCount );
-
-    // Run algorithms on collected samples
     ppgComputeHrAndHrv();
     ppgComputeSpO2();
     ppgResultsValid = ( ppgHeartRate > 0 );
@@ -488,12 +525,46 @@ void ppgStopSampling()
         ppgHeartRate, ppgSpO2, ppgHrv, ppgResultsValid );
 }
 
-// Convenience wrapper that starts sampling, waits durationMs, then stops.
+// Runs three sequential LED passes (green → red → IR), each of durationMs, with periodic
+// mid-window FIFO draining. Fills all three sample buffers, then runs all algorithms.
 void ppgCollectSamples( uint32_t durationMs )
 {
-    ppgStartSampling();
-    delay( durationMs );
-    ppgStopSampling();
+    ppgWriteIndex   = 0;
+    ppgSampleCount  = 0;
+    ppgResultsValid = false;
+
+    uint16_t greenCount = 0, redCount = 0, irCount = 0;
+
+    // Pass 1: green (LED3) — primary channel for HR and HRV
+    DBG( "PPG", "Pass 1/3: green (LED3), %lu ms", ( unsigned long )durationMs );
+    ppgRunPass( LED_CFG_LED3_EN, 0x00, LED3_MODE_SEQUENCER,
+                ppgGreenBuffer, &greenCount, PPG_BUFFER_SIZE, durationMs );
+    DBG( "PPG", "Pass 1 complete: %u green samples", greenCount );
+
+    // Pass 2: red (LED1) — SpO2 numerator channel
+    DBG( "PPG", "Pass 2/3: red (LED1), %lu ms", ( unsigned long )durationMs );
+    ppgRunPass( LED_CFG_LED1_EN, LED1_MODE_SEQUENCER, 0x00,
+                ppgRedBuffer, &redCount, PPG_BUFFER_SIZE, durationMs );
+    DBG( "PPG", "Pass 2 complete: %u red samples", redCount );
+
+    // Pass 3: IR (LED2) — SpO2 denominator channel
+    DBG( "PPG", "Pass 3/3: IR (LED2), %lu ms", ( unsigned long )durationMs );
+    ppgRunPass( LED_CFG_LED2_EN, LED2_MODE_SEQUENCER, 0x00,
+                ppgIrBuffer, &irCount, PPG_BUFFER_SIZE, durationMs );
+    DBG( "PPG", "Pass 3 complete: %u IR samples", irCount );
+
+    // Use the minimum sample count across channels so no algorithm reads past valid data
+    ppgSampleCount = greenCount < redCount ? greenCount : redCount;
+    if( irCount < ppgSampleCount ) ppgSampleCount = irCount;
+    DBG( "PPG", "Collection complete: %u valid samples (green=%u red=%u ir=%u)",
+        ppgSampleCount, greenCount, redCount, irCount );
+
+    ppgComputeHrAndHrv();
+    ppgComputeSpO2();
+    ppgResultsValid = ( ppgHeartRate > 0 );
+
+    DBG( "PPG", "Algorithm results: HR=%u SpO2=%u HRV=%u valid=%d",
+        ppgHeartRate, ppgSpO2, ppgHrv, ppgResultsValid );
 }
 
 // Writes the last computed heart rate in BPM to bpm. Returns false if results are invalid.
@@ -520,39 +591,30 @@ bool ppgGetHrv( uint16_t* rmssd )
     return true;
 }
 
-// Drains all complete red+IR+green FIFO triplets and returns the most recent sample.
-// Returns false if fewer than three FIFO entries are available.
+// Drains all available FIFO entries and returns the most recent sample in all three channels.
+// Single-LED red mode: all three output pointers receive the same red value.
+// Returns false if no FIFO entries are available.
 bool ppgReadLatestFifoSample( uint16_t* red, uint16_t* ir, uint16_t* green, uint8_t* fifoLevel )
 {
     uint8_t level = ppgReadReg( REG_FIFOLEVEL );
     if( fifoLevel ) *fifoLevel = level;
 
-    // Need at least one complete red+IR+green triplet (three entries)
-    if( level < 3 ) return false;
+    if( level < 1 ) return false;
 
-    uint16_t lastRed = 0, lastIr = 0, lastGreen = 0;
-    uint8_t  tripletsToRead = level / 3;
+    uint16_t lastSample = 0;
 
-    // Drain all complete triplets; keep only the last one (most recent sample)
-    for( uint8_t i = 0; i < tripletsToRead; i++ )
+    // Drain all entries; keep only the last (most recent)
+    for( uint8_t i = 0; i < level; i++ )
     {
-        uint8_t lo, hi;
-        lo = ppgReadReg( REG_FIFOL );
-        hi = ppgReadReg( REG_FIFOH ) & 0x3F;
-        lastRed = ( ( uint16_t )hi << 8 ) | lo;
-
-        lo = ppgReadReg( REG_FIFOL );
-        hi = ppgReadReg( REG_FIFOH ) & 0x3F;
-        lastIr = ( ( uint16_t )hi << 8 ) | lo;
-
-        lo = ppgReadReg( REG_FIFOL );
-        hi = ppgReadReg( REG_FIFOH ) & 0x3F;
-        lastGreen = ( ( uint16_t )hi << 8 ) | lo;
+        uint8_t lo = ppgReadReg( REG_FIFOL );
+        uint8_t hi = ppgReadReg( REG_FIFOH ) & 0x3F;
+        lastSample = ( ( uint16_t )hi << 8 ) | lo;
     }
 
-    if( red )   *red   = lastRed;
-    if( ir )    *ir    = lastIr;
-    if( green ) *green = lastGreen;
+    // Single-LED red mode: all channels report the same red OFE1 value
+    if( red )   *red   = lastSample;
+    if( ir )    *ir    = lastSample;
+    if( green ) *green = lastSample;
     return true;
 }
 

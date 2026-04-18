@@ -11,7 +11,6 @@ LSM6DSOSensor imuSensor( &Wire, 0xD6 );
 static const uint8_t IMU_I2C_ADDR = 0x6B;
 
 // Register addresses for embedded function page access
-static const uint8_t REG_FUNC_CFG_ACCESS = 0x01;
 static const uint8_t REG_PAGE_SEL        = 0x02;
 static const uint8_t REG_PAGE_ADDRESS    = 0x08;
 static const uint8_t REG_PAGE_VALUE      = 0x09;
@@ -43,12 +42,9 @@ static uint8_t imuReadReg( uint8_t reg )
 }
 
 // Reads a value from the embedded function memory page at the given 16-bit address.
+// PAGE_RW/PAGE_SEL/PAGE_ADDRESS/PAGE_VALUE are user-bank registers; no bank switch needed.
 static bool imuReadEmbeddedFuncReg( uint16_t addr, uint8_t* val )
 {
-    // Switch to embedded function bank
-    uint8_t funcCfg = imuReadReg( REG_FUNC_CFG_ACCESS );
-    imuWriteReg( REG_FUNC_CFG_ACCESS, ( funcCfg & 0x3F ) | 0x80 );
-
     // Enable page read
     uint8_t pageRw = imuReadReg( REG_PAGE_RW );
     pageRw = ( pageRw & 0x9F ) | ( 0x01 << 5 );  // page_rw = 0x01 (read)
@@ -70,20 +66,13 @@ static bool imuReadEmbeddedFuncReg( uint16_t addr, uint8_t* val )
     pageRw &= 0x9F;  // page_rw = 0x00
     imuWriteReg( REG_PAGE_RW, pageRw );
 
-    // Switch back to user bank
-    funcCfg = imuReadReg( REG_FUNC_CFG_ACCESS );
-    imuWriteReg( REG_FUNC_CFG_ACCESS, funcCfg & 0x3F );
-
     return true;
 }
 
 // Writes a value to the embedded function memory page at the given 16-bit address.
+// PAGE_RW/PAGE_SEL/PAGE_ADDRESS/PAGE_VALUE are user-bank registers; no bank switch needed.
 static bool imuWriteEmbeddedFuncReg( uint16_t addr, uint8_t val )
 {
-    // Switch to embedded function bank
-    uint8_t funcCfg = imuReadReg( REG_FUNC_CFG_ACCESS );
-    imuWriteReg( REG_FUNC_CFG_ACCESS, ( funcCfg & 0x3F ) | 0x80 );
-
     // Enable page write
     uint8_t pageRw = imuReadReg( REG_PAGE_RW );
     pageRw = ( pageRw & 0x9F ) | ( 0x02 << 5 );  // page_rw = 0x02 (write)
@@ -104,10 +93,6 @@ static bool imuWriteEmbeddedFuncReg( uint16_t addr, uint8_t val )
     pageRw = imuReadReg( REG_PAGE_RW );
     pageRw &= 0x9F;  // page_rw = 0x00
     imuWriteReg( REG_PAGE_RW, pageRw );
-
-    // Switch back to user bank
-    funcCfg = imuReadReg( REG_FUNC_CFG_ACCESS );
-    imuWriteReg( REG_FUNC_CFG_ACCESS, funcCfg & 0x3F );
 
     return true;
 }
